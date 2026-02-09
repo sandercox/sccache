@@ -176,6 +176,8 @@ pub enum CCompilerKind {
     Gcc,
     /// clang
     Clang,
+    /// clang-tidy (static analyzer, not a compiler)
+    ClangTidy,
     /// Diab
     Diab,
     /// Microsoft Visual C++

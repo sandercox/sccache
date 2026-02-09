@@ -18,6 +18,7 @@ use crate::compiler::args::*;
 use crate::compiler::c::{CCompiler, CCompilerKind};
 use crate::compiler::cicc::Cicc;
 use crate::compiler::clang::Clang;
+use crate::compiler::clang_tidy::ClangTidy;
 use crate::compiler::cudafe::CudaFE;
 use crate::compiler::diab::Diab;
 use crate::compiler::gcc::Gcc;
@@ -466,6 +467,7 @@ impl CompilerKind {
         let textual_lang = lang.as_str().to_owned();
         match self {
             CompilerKind::C(CCompilerKind::Clang) => textual_lang + " [clang]",
+            CompilerKind::C(CCompilerKind::ClangTidy) => textual_lang + " [clang-tidy]",
             CompilerKind::C(CCompilerKind::Diab) => textual_lang + " [diab]",
             CompilerKind::C(CCompilerKind::Gcc) => textual_lang + " [gcc]",
             CompilerKind::C(CCompilerKind::Msvc) => textual_lang + " [msvc]",
@@ -1461,6 +1463,16 @@ fn is_nvidia_ptxas<P: AsRef<Path>>(p: P) -> bool {
     )
 }
 
+/// Returns true for `clang-tidy[.exe]` and versioned forms like
+/// `clang-tidy-17`, `clang-tidy-18.exe`.
+fn is_clang_tidy<P: AsRef<Path>>(p: P) -> bool {
+    p.as_ref()
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .as_deref()
+        .is_some_and(|s| s == "clang-tidy" || s.starts_with("clang-tidy-"))
+}
+
 /// Returns true if the given path looks like a c compiler program
 ///
 /// This does not check c compilers, it only report programs that are definitely not rustc
@@ -1558,6 +1570,11 @@ where
         )
         .await
         .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
+    } else if is_clang_tidy(executable) {
+        debug!("Found clang-tidy");
+        return CCompiler::new(ClangTidy { version: None }, executable.to_owned(), &pool)
+            .await
+            .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
     } else if is_known_c_compiler(executable) {
         let cc = detect_c_compiler(creator, executable, args, cwd, env.to_vec(), pool).await;
         return cc.map(|c| (c, None));
@@ -3899,6 +3916,25 @@ LLVM version: 6.0",
             assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
             assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
         }
+    }
+
+    #[test]
+    fn test_is_clang_tidy_versioned() {
+        // Recognized
+        assert!(is_clang_tidy("clang-tidy"));
+        assert!(is_clang_tidy("clang-tidy.exe"));
+        assert!(is_clang_tidy("clang-tidy-17"));
+        assert!(is_clang_tidy("clang-tidy-18.exe"));
+        assert!(is_clang_tidy("Clang-Tidy-19"));
+        assert!(is_clang_tidy("/usr/bin/clang-tidy-17"));
+        #[cfg(windows)]
+        assert!(is_clang_tidy("C:\\LLVM\\bin\\clang-tidy.exe"));
+
+        // Rejected: similar prefixes that aren't clang-tidy
+        assert!(!is_clang_tidy("clang"));
+        assert!(!is_clang_tidy("clangtidy"));
+        assert!(!is_clang_tidy("clang-tidy_wrapper"));
+        assert!(!is_clang_tidy("clang-format"));
     }
 }
 
