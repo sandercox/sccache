@@ -396,35 +396,35 @@ where
     let config_output = run_dump_config(creator, executable, parsed_args, cwd, env_vars).await?;
 
     // Step 2: Run the underlying compiler with -E/`/E` to get preprocessed
-    // source. If the source has compilation errors the preprocessor exits
-    // non-zero — keep going regardless, so the actual clang-tidy run can
-    // surface the real diagnostics. The error output is folded into the hash
-    // key, making the broken state cache-distinct.
-    let preprocessed = match run_preprocessor(creator, executable, parsed_args, cwd, env_vars).await
-    {
-        Ok(output) => output,
-        Err(err) => match err.downcast::<ProcessError>() {
-            Ok(ProcessError(output)) => {
-                debug!(
-                    "clang-tidy preprocessor exited with status {:?}, continuing with available output",
-                    output.status.code()
-                );
-                output
-            }
-            Err(err) => return Err(err),
-        },
-    };
+    // source. Keep going if it fails so the actual clang-tidy run can surface
+    // the real diagnostics.
+    let (preprocessed, preprocess_failed) =
+        match run_preprocessor(creator, executable, parsed_args, cwd, env_vars).await {
+            Ok(output) => (output, false),
+            Err(err) => match err.downcast::<ProcessError>() {
+                Ok(ProcessError(output)) => {
+                    warn!(
+                        "clang-tidy preprocessor exited with status {:?}, not caching: {}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                    (output, true)
+                }
+                Err(err) => return Err(err),
+            },
+        };
 
     // Combine: config dump + preprocessed source
     let mut combined = config_output.stdout;
     combined.extend_from_slice(b"\n---PREPROCESSED---\n");
     combined.extend_from_slice(&preprocessed.stdout);
 
-    // Include preprocessor stderr in the hash key — if the source has errors,
-    // the error output makes the hash unique to this broken state.
-    if !preprocessed.stderr.is_empty() {
-        combined.extend_from_slice(b"\n---PREPROCESSOR-STDERR---\n");
-        combined.extend_from_slice(&preprocessed.stderr);
+    // A failed preprocess may not reflect the source at all (e.g. cl.exe
+    // rejecting a flag yields empty stdout), so a stable key would replay
+    // stale results. Force a unique key instead.
+    if preprocess_failed {
+        combined.extend_from_slice(b"\n---PREPROCESS-FAILED---\n");
+        combined.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
     }
 
     // Combine stderr from both steps
@@ -542,9 +542,12 @@ where
 
     // clang-tidy contract: --extra-arg-before precedes compile flags;
     // --extra-arg follows them. Misplacement breaks positional flags like -x.
+    // They target clang-tidy's internal clang, so only a clang compiler
+    // understands them; cl.exe aborts on e.g. -Wmissing-braces.
     let mut extra_arg_before: Vec<String> = Vec::new();
     let mut extra_arg_after: Vec<String> = Vec::new();
-    for arg in &tidy_args {
+    let forward_extra_args = is_clang_compiler(compiler);
+    for arg in tidy_args.iter().filter(|_| forward_extra_args) {
         let s = arg.to_string_lossy();
         if let Some(val) = s
             .strip_prefix("--extra-arg-before=")
@@ -582,6 +585,10 @@ where
         if is_concatenated_output_flag(&s) {
             continue;
         }
+        // The input is appended below; passing it twice preprocesses it twice.
+        if Path::new(arg) == parsed_args.input {
+            continue;
+        }
 
         cmd.arg(*arg);
     }
@@ -595,6 +602,18 @@ where
 
     trace!("preprocessing for clang-tidy: {:?}", cmd);
     run_input_output(cmd, None).await
+}
+
+/// Whether `compiler` is clang (clang, clang++, clang-cl, clang-18, ...).
+fn is_clang_compiler(compiler: &OsString) -> bool {
+    Path::new(compiler)
+        .file_stem()
+        .map(|s| {
+            s.to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("clang")
+        })
+        .unwrap_or(false)
 }
 
 /// Check if the first argument after `--` looks like a compiler path rather than a flag.
@@ -1090,6 +1109,122 @@ mod test {
             stderr_str.contains("fatal error: oops"),
             "preprocessor stderr surfaced to caller, got: {stderr_str}"
         );
+    }
+
+    fn parsed_with_common_args(common_args: &[&str]) -> ParsedArguments {
+        match parse_args(common_args) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+    }
+
+    /// Runs `preprocess` with a succeeding `--dump-config` and returns the
+    /// hash input plus the args the underlying compiler was invoked with.
+    fn run_preprocess(
+        args: &[&str],
+        preprocessor_status: ExitStatusValue,
+        preprocessor_stdout: &'static [u8],
+    ) -> (Vec<u8>, Vec<String>) {
+        use std::sync::{Arc, Mutex};
+        let creator = new_creator();
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), b"Checks: '*'", b"")),
+        );
+        let seen = Arc::new(Mutex::new(vec![]));
+        let seen_in_call = Arc::clone(&seen);
+        next_command_calls(&creator, move |args| {
+            *seen_in_call.lock().unwrap() = args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            Ok(MockChild::new(
+                exit_status(preprocessor_status),
+                preprocessor_stdout,
+                b"",
+            ))
+        });
+
+        let parsed = parsed_with_common_args(args);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(preprocess(
+                &creator,
+                Path::new("clang-tidy"),
+                &parsed,
+                Path::new("."),
+                &[],
+            ))
+            .expect("preprocess succeeds");
+        let seen = seen.lock().unwrap().clone();
+        (output.stdout, seen)
+    }
+
+    #[test]
+    fn test_preprocess_cl_does_not_receive_extra_args() {
+        let (_, cl_args) = run_preprocess(
+            &[
+                "--extra-arg-before=--driver-mode=cl",
+                "--extra-arg=-Wmissing-braces",
+                "foo.cpp",
+                "--",
+                "C:\\MSVC\\cl.exe",
+                "/nologo",
+                "-c",
+                "foo.cpp",
+            ],
+            0,
+            b"int x;",
+        );
+        assert_eq!(cl_args, vec!["/nologo", "/E", "foo.cpp"]);
+    }
+
+    #[test]
+    fn test_preprocess_clang_receives_extra_args() {
+        let (_, clang_args) = run_preprocess(
+            &[
+                "--extra-arg-before=--driver-mode=g++",
+                "--extra-arg=-Wno-error",
+                "foo.cpp",
+                "--",
+                "/usr/bin/clang++",
+                "-DFOO",
+                "-c",
+                "foo.cpp",
+            ],
+            0,
+            b"int x;",
+        );
+        assert_eq!(
+            clang_args,
+            vec!["--driver-mode=g++", "-DFOO", "-Wno-error", "-E", "foo.cpp"]
+        );
+    }
+
+    #[test]
+    fn test_preprocess_failure_never_yields_stable_key() {
+        let args = ["foo.cpp", "--", "C:\\MSVC\\cl.exe", "/nologo"];
+        let (first, _) = run_preprocess(&args, 2, b"");
+        let (second, _) = run_preprocess(&args, 2, b"");
+        assert_ne!(first, second);
+
+        let (ok_first, _) = run_preprocess(&args, 0, b"int x;");
+        let (ok_second, _) = run_preprocess(&args, 0, b"int x;");
+        assert_eq!(ok_first, ok_second);
+    }
+
+    #[test]
+    fn test_is_clang_compiler() {
+        assert!(is_clang_compiler(&"clang".into()));
+        assert!(is_clang_compiler(&"/usr/bin/clang++".into()));
+        assert!(is_clang_compiler(&"C:\\LLVM\\bin\\clang-cl.exe".into()));
+        assert!(is_clang_compiler(&"clang-18".into()));
+        assert!(!is_clang_compiler(&"C:\\MSVC\\cl.exe".into()));
+        assert!(!is_clang_compiler(&"/usr/bin/g++".into()));
+        assert!(!is_clang_compiler(&"gcc".into()));
     }
 
     #[test]
