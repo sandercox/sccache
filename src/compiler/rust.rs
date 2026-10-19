@@ -1979,11 +1979,11 @@ where
         _may_dist: bool,
         pool: &tokio::runtime::Handle,
         _rewrite_includes_only: bool,
-        storage: Arc<dyn Storage>,
+        _storage: Arc<dyn Storage>,
+        basedirs: &[Vec<u8>],
         _cache_control: CacheControl,
     ) -> Result<HashResult<T>> {
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
-        let basedirs = storage.basedirs();
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
         let os_string_arguments: Vec<(OsString, Option<OsString>)> = self
             .parsed_args
@@ -4493,6 +4493,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 &pool,
                 false,
                 Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                &[],
                 CacheControl::Default,
             )
             .wait()
@@ -4585,6 +4586,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                     &pool,
                     false,
                     Arc::new(MockStorage::new(None, false)),
+                    &[],
                     CacheControl::Default,
                 )
                 .wait()
@@ -4675,6 +4677,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 &pool,
                 false,
                 Arc::new(MockStorage::new(None, false)),
+                &[],
                 CacheControl::Default,
             )
             .wait()
@@ -4790,6 +4793,7 @@ foo.rs:
 
         mock_dep_info_with_env(&creator, &["foo.rs"], env_deps);
         mock_file_names(&creator, &["foo.rlib"]);
+        let basedirs = storage.basedirs().to_vec();
         hasher
             .generate_hash_key(
                 &creator,
@@ -4799,6 +4803,7 @@ foo.rs:
                 &pool,
                 false,
                 Arc::new(storage),
+                &basedirs,
                 CacheControl::Default,
             )
             .wait()
