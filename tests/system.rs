@@ -2522,6 +2522,20 @@ fn test_unreadable_preprocessor_cache_entry_is_a_miss() {
 #[serial]
 #[cfg(all(unix, not(target_os = "macos")))]
 fn test_basedirs_preprocessor_cache_checks_own_tree() {
+    basedirs_preprocessor_cache_checks_own_tree(false);
+}
+
+/// Same, with each compile naming its own tree in `SCCACHE_BASEDIRS` and the
+/// server configured with none.
+#[test]
+#[serial]
+#[cfg(all(unix, not(target_os = "macos")))]
+fn test_compile_env_basedirs_preprocessor_cache_checks_own_tree() {
+    basedirs_preprocessor_cache_checks_own_tree(true);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn basedirs_preprocessor_cache_checks_own_tree(from_compile_env: bool) {
     let _ = env_logger::try_init();
     let tempdir = tempfile::Builder::new()
         .prefix("sccache_system_test")
@@ -2562,15 +2576,18 @@ fn test_basedirs_preprocessor_cache_checks_own_tree() {
     }
 
     let mut sccache_cfg = sccache_client_cfg(tempdir.path(), true);
-    sccache_cfg.basedirs = trees
-        .iter()
-        .map(|tree| tree.to_str().unwrap().to_string())
-        .collect();
+    if !from_compile_env {
+        sccache_cfg.basedirs = trees
+            .iter()
+            .map(|tree| tree.to_str().unwrap().to_string())
+            .collect();
+    }
     restart_local_daemon_with(tempdir.path(), &sccache_cfg);
     zero_stats();
 
     let compile = |tree: &Path| {
-        sccache_command()
+        let mut command = sccache_command();
+        command
             .args(compile_cmdline(
                 compiler.name,
                 &compiler.exe,
@@ -2579,9 +2596,11 @@ fn test_basedirs_preprocessor_cache_checks_own_tree() {
                 vec![OsString::from(format!("-I{}", tree.join("inc").display()))],
             ))
             .current_dir(tree)
-            .envs(compiler.env_vars.clone())
-            .assert()
-            .success();
+            .envs(compiler.env_vars.clone());
+        if from_compile_env {
+            command.env("SCCACHE_BASEDIRS", tree);
+        }
+        command.assert().success();
         fs::read(tree.join("main.o")).unwrap()
     };
 

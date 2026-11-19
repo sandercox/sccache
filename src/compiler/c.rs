@@ -514,7 +514,7 @@ where
         // records have to be checked against this tree's copies and not against
         // the ones that happened to write the entry.
         let tree_root = if preprocessor_key.is_some() {
-            compilation_tree_root(&absolute_input_path, &cwd, storage.basedirs())?
+            compilation_tree_root(&absolute_input_path, &cwd, basedirs)?
         } else {
             None
         };
@@ -716,7 +716,7 @@ where
                 start_of_compilation,
                 &key,
                 files,
-                storage.basedirs(),
+                basedirs,
                 tree_root.as_deref(),
             );
 
