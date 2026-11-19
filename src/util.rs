@@ -1447,7 +1447,7 @@ fn unnormalized_len(path: &[u8], normalized: &[u8], len: usize) -> Option<usize>
 /// * the whole argument, as in a source file or the path of a separated
 ///   option such as `-include-pch <path>`;
 /// * the value of an option written with an `=`, as in `--sysroot=<path>` or
-///   either half of `-ffile-prefix-map=<path>=<path>`;
+///   the old path of `-ffile-prefix-map=<old>=<new>`;
 /// * the value glued to an option, as in `-I<path>`, `-L<path>` or
 ///   `-external:I<path>`, also when it starts with a drive letter, as in
 ///   `-IC:\path` or `/IC:\path`.
@@ -1457,6 +1457,10 @@ fn unnormalized_len(path: &[u8], normalized: &[u8], len: usize) -> Option<usize>
 /// also has to end where a path component ends, so `/home/user/project` does not
 /// match the start of `/home/user/project-docs`.  The longest basedir wins, so a
 /// nested one takes precedence over the tree that contains it.
+///
+/// The new path of a prefix map is left alone as well: the compiler writes it
+/// into the output, so `-ffile-prefix-map=/home/user/project=/home/user/project`
+/// yields an object that names its checkout.
 pub fn strip_basedirs_from_arg<'a>(arg: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u8]> {
     if basedirs.is_empty() || arg.is_empty() {
         return Cow::Borrowed(arg);
@@ -1523,6 +1527,14 @@ pub fn strip_basedirs_from_arg<'a>(arg: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'
 ///
 /// See [`strip_basedirs_from_arg`] for what they are and why the rest of the
 /// argument is off limits.
+/// `-ffile-prefix-map=<old>=<new>` and its debug, macro, profile and coverage
+/// variants.
+fn is_prefix_map(arg: &[u8]) -> bool {
+    arg.split(|b| *b == b'=')
+        .next()
+        .is_some_and(|name| name.starts_with(b"-f") && name.ends_with(b"-prefix-map"))
+}
+
 fn pathname_positions(arg: &[u8]) -> impl Iterator<Item = usize> + '_ {
     // The value glued to an option starts where the option name ends:
     // `-I/path` yields 2, `-isystem/path` 8 and `-external:I/path` 11. A drive
@@ -1556,7 +1568,8 @@ fn pathname_positions(arg: &[u8]) -> impl Iterator<Item = usize> + '_ {
         .iter()
         .enumerate()
         .filter(|(_, b)| **b == b'=')
-        .map(|(i, _)| i + 1);
+        .map(|(i, _)| i + 1)
+        .take(if is_prefix_map(arg) { 1 } else { usize::MAX });
 
     let mut positions: Vec<usize> = std::iter::once(0).chain(glued).chain(equals).collect();
     positions.sort_unstable();
@@ -2284,12 +2297,37 @@ mod tests {
             b"-external:Iinclude"
         );
 
-        // The value of an =-separated option, and both halves of a prefix map.
+        // The value of an =-separated option.
         assert_eq!(strip(b"--sysroot=/home/user/project/sys"), b"--sysroot=sys");
+    }
+
+    #[test]
+    fn test_strip_basedirs_from_arg_keeps_new_path_of_prefix_map() {
+        let basedir = b"/home/user/project/".to_vec();
+        let strip = |arg: &[u8]| {
+            super::strip_basedirs_from_arg(arg, std::slice::from_ref(&basedir)).into_owned()
+        };
+
+        // The compiler writes the new path into the object file, so two
+        // checkouts mapping onto their own tree must not share an entry.
         assert_eq!(
             strip(b"-ffile-prefix-map=/home/user/project/build=/home/user/project"),
-            b"-ffile-prefix-map=build="
+            b"-ffile-prefix-map=build=/home/user/project"
         );
+        // A file mapped onto itself keeps its absolute __FILE__.
+        assert_eq!(
+            strip(b"-ffile-prefix-map=/home/user/project/a.c=/home/user/project/a.c"),
+            b"-ffile-prefix-map=a.c=/home/user/project/a.c"
+        );
+        for flag in ["debug", "macro", "profile", "coverage"] {
+            assert_eq!(
+                strip(
+                    format!("-f{flag}-prefix-map=/home/user/project=/home/user/project/x")
+                        .as_bytes()
+                ),
+                format!("-f{flag}-prefix-map==/home/user/project/x").as_bytes()
+            );
+        }
     }
 
     #[test]
